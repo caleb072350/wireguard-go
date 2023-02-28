@@ -5,12 +5,15 @@ package tun
 import (
 	"bytes"
 	"errors"
+	"net"
 	"os"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/caleb072350/wireguard-go/rwcancel"
+	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 )
 
@@ -37,7 +40,34 @@ func (tun *NativeTun) File() *os.File {
 }
 
 func (tun *NativeTun) routineHackListener() {
-
+	defer tun.hackListenerClosed.Unlock()
+	/* This is needed for the detection to work across network namespaces
+	 */
+	for {
+		sysconn, err := tun.tunFile.SyscallConn()
+		if err != nil {
+			return
+		}
+		err2 := sysconn.Control(func(fd uintptr) {
+			_, err = unix.Write(int(fd), nil)
+		})
+		if err2 != nil {
+			return
+		}
+		switch err {
+		case unix.EINVAL:
+			tun.events <- EventUp
+		case unix.EIO:
+			tun.events <- EventDown
+		default:
+			return
+		}
+		select {
+		case <-time.After(time.Second):
+		case <-tun.statusListenersShutdown:
+			return
+		}
+	}
 }
 
 func (tun *NativeTun) Name() (string, error) {
@@ -68,6 +98,134 @@ func (tun *NativeTun) Name() (string, error) {
 	}
 	tun.name = string(nullStr)
 	return tun.name, nil
+}
+
+func (tun *NativeTun) isUp() (bool, error) {
+	inter, err := net.InterfaceByName(tun.name)
+	return inter.Flags&net.FlagUp != 0, err
+}
+
+func (tun *NativeTun) setMTU(n int) error {
+	// open datagram socket
+	fd, err := unix.Socket(
+		unix.AF_INET,
+		unix.SOCK_DGRAM,
+		0,
+	)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+
+	// do ioctl call
+
+	var ifr [ifReqSize]byte
+	copy(ifr[:], tun.name)
+	*(*uint32)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) = uint32(n)
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		uintptr(unix.SIOCSIFMTU),
+		uintptr(unsafe.Pointer(&ifr[0])),
+	)
+	if errno != 0 {
+		return errors.New("failed to set MTU of TUN device")
+	}
+	return nil
+}
+
+func (tun *NativeTun) MTU() (int, error) {
+	// open datagram socket
+	fd, err := unix.Socket(
+		unix.AF_INET,
+		unix.SOCK_DGRAM,
+		0,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer unix.Close(fd)
+
+	//do ioctl call
+	var ifr [ifReqSize]byte
+	copy(ifr[:], tun.name)
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		uintptr(unix.SIOCGIFMTU),
+		uintptr(unsafe.Pointer(&ifr[0])),
+	)
+	if errno != 0 {
+		return 0, errors.New("failed to get MTU of TUN device: " + errno.Error())
+	}
+	return int(*(*int32)(unsafe.Pointer(&ifr[unix.IFNAMSIZ]))), nil
+}
+
+func (tun *NativeTun) Write(buff []byte, offset int) (int, error) {
+	if tun.nopi {
+		buff = buff[offset:]
+	} else {
+		// reserve space for header
+		buff = buff[offset-4:]
+
+		// add packet information header
+		buff[0] = 0x00
+		buff[1] = 0x00
+
+		if buff[4]>>4 == ipv6.Version {
+			buff[2] = 0x86
+			buff[3] = 0xdd
+		} else {
+			buff[2] = 0x08
+			buff[3] = 0x00
+		}
+	}
+	// write
+	return tun.tunFile.Write(buff)
+}
+
+func (tun *NativeTun) Flush() error {
+	// TODO: can flushing be implemented by buffering and using sendmsg?
+	return nil
+}
+
+func (tun *NativeTun) Read(buff []byte, offset int) (int, error) {
+	select {
+	case err := <-tun.errors:
+		return 0, err
+	default:
+		if tun.nopi {
+			return tun.tunFile.Read(buff[offset:])
+		} else {
+			buff := buff[offset-4:]
+			n, err := tun.tunFile.Read(buff[:])
+			if n < 4 {
+				return 0, err
+			}
+			return n - 4, err
+		}
+	}
+}
+
+func (tun *NativeTun) Events() chan Event {
+	return tun.events
+}
+
+func (tun *NativeTun) Close() error {
+	var err1 error
+	if tun.statusListenersShutdown != nil {
+		close(tun.statusListenersShutdown)
+		if tun.netlinkCancel != nil {
+			err1 = tun.netlinkCancel.Cancel()
+		}
+	} else if tun.events != nil {
+		close(tun.events)
+	}
+	err2 := tun.tunFile.Close()
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }
 
 func getIFIndex(name string) (int32, error) {
