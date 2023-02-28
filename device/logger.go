@@ -1,25 +1,24 @@
 package device
 
 import (
+	"io"
+	"io/ioutil"
 	"log"
 	"os"
 )
 
-// A Logger provides logging for a Device.
-// The functions are Printf-style functions.
-// They must be safe for concurrent use.
-// They do not require a trailing newline in the format.
-// If nil, that level of logging will be silent.
 type Logger struct {
-	Verbosef func(format string, args ...any)
-	Errorf   func(format string, args ...any)
+	Debug *log.Logger
+	Info  *log.Logger
+	Error *log.Logger
 }
 
 // Log levels for use with NewLogger.
 const (
 	LogLevelSilent = iota
 	LogLevelError
-	LogLevelVerbose
+	LogLevelInfo
+	LogLevelDebug
 )
 
 // Function for use in Logger for discarding logged lines.
@@ -29,15 +28,33 @@ func DiscardLogf(format string, args ...any) {}
 // It logs at the specified log level and above.
 // It decorates log lines with the log level, date, time and prepend.
 func NewLogger(level int, prepend string) *Logger {
-	logger := &Logger{DiscardLogf, DiscardLogf}
-	logf := func(prefix string) func(string, ...any) {
-		return log.New(os.Stdout, prefix+": "+prepend, log.Ldate|log.Ltime).Printf
-	}
-	if level >= LogLevelVerbose {
-		logger.Verbosef = logf("DEBUG")
-	}
-	if level >= LogLevelError {
-		logger.Errorf = logf("ERROR")
-	}
+	output := os.Stdout
+	logger := new(Logger)
+
+	logErr, logInfo, logDebug := func() (io.Writer, io.Writer, io.Writer) {
+		if level >= LogLevelDebug {
+			return output, output, output
+		}
+		if level >= LogLevelInfo {
+			return output, output, ioutil.Discard
+		}
+		if level >= LogLevelError {
+			return output, ioutil.Discard, ioutil.Discard
+		}
+		return ioutil.Discard, ioutil.Discard, ioutil.Discard
+	}()
+
+	logger.Debug = log.New(logDebug,
+		"DEBUG: "+prepend,
+		log.Ldate|log.Ltime,
+	)
+	logger.Info = log.New(logInfo,
+		"INFO: "+prepend,
+		log.Ldate|log.Ltime,
+	)
+	logger.Error = log.New(logErr,
+		"ERROR: "+prepend,
+		log.Ldate|log.Ltime,
+	)
 	return logger
 }
