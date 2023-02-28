@@ -1,6 +1,11 @@
 package device
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+
+	"github.com/caleb072350/wireguard-go/tun"
+)
 
 const (
 	DeviceRoutineNumberPerCPU     = 3
@@ -35,5 +40,45 @@ type Device struct {
 		sync.RWMutex
 		privateKey NoisePrivateKey
 		publicKey  NoisePublicKey
+	}
+
+	peers struct {
+		sync.RWMutex
+		keyMap map[NoisePublicKey]*Peer
+	}
+
+	// unprotected / "self-synchronising resources"
+
+	allowedips    allowedips
+	indexTable    indexTable
+	cookieChecker cookieChecker
+
+	rate struct {
+		underLoadUntil atomic.Value
+		limiter        ratelimiter.ratelimiter
+	}
+
+	pool struct {
+		messageBufferPool        *sync.Pool
+		messageBufferReuseChan   chan *[MaxMessageSize]byte
+		inboundElementPool       *sync.Pool
+		inboundElementReuseChan  chan *QueueInboundElement
+		outboundElementPool      *sync.Pool
+		outboundElementReuseChan chan *QueueOutboundElement
+	}
+
+	queue struct {
+		encryption chan *QueueOutboundElement
+		decryption chan *QueueInboundElement
+		handshake  chan QueueHandshakeElement
+	}
+
+	signals struct {
+		stop chan struct{}
+	}
+
+	tun struct {
+		device tun.Device
+		mtu    int32
 	}
 }
